@@ -383,24 +383,51 @@ def discover_candidate_groups(
     statuses,
     min_cluster_size=3
 ):
+    """
+    Discover potential new complaint groups among complaints
+    marked for review.
+
+    Returns exactly one entry per input complaint. Complaints
+    not assigned to a sufficiently large cluster receive "".
+    """
+
     if len(texts) != len(statuses):
         raise ValueError(
             "Number of complaints and statuses must match."
         )
 
-    review_texts = [
-        str(text).strip()
-        for text, status in zip(texts, statuses)
-        if text is not None
-        and str(text).strip()
-        and status == "review"
-    ]
+    if min_cluster_size < 2:
+        raise ValueError(
+            "min_cluster_size must be at least 2."
+        )
 
+    # Preserve alignment with every original complaint row.
+    candidate_groups = [""] * len(texts)
+
+    review_indices = []
+    review_texts = []
+
+    for original_index, (text, status) in enumerate(zip(texts, statuses)):
+        if text is None:
+            continue
+
+        text_value = str(text).strip()
+        status_value = str(status).strip().lower()
+
+        if (
+            text_value
+            and text_value.lower() not in {"nan", "none"}
+            and status_value == "review"
+        ):
+            review_indices.append(original_index)
+            review_texts.append(text_value)
+
+    # Even when clustering is skipped, return a list aligned
+    # with the complete input dataset.
     if len(review_texts) < min_cluster_size * 2:
-        return []
+        return candidate_groups
 
     encoder = _get_encoder()
-
     embeddings = encoder.encode(
         review_texts,
         show_progress_bar=False
@@ -415,30 +442,29 @@ def discover_candidate_groups(
     )
 
     if n_clusters >= len(review_texts):
-        return []
+        return candidate_groups
 
     clustering = KMeans(
         n_clusters=n_clusters,
         random_state=RANDOM_STATE,
         n_init=10
     )
+    cluster_labels = clustering.fit_predict(embeddings)
 
-    cluster_labels = clustering.fit_predict(
-        embeddings
-    )
-
-    candidate_groups = []
-
+    # Map each cluster member back to its original complaint row.
     for cluster_id in range(n_clusters):
-        cluster_size = int(
-            np.sum(cluster_labels == cluster_id)
-        )
+        cluster_positions = np.where(cluster_labels == cluster_id)[0]
+        cluster_size = len(cluster_positions)
 
         if cluster_size >= min_cluster_size:
-            candidate_groups.append(
+            group_name = (
                 f"Potential new complaint group "
                 f"{cluster_id + 1} "
                 f"({cluster_size} complaints)"
             )
+
+            for review_position in cluster_positions:
+                original_index = review_indices[review_position]
+                candidate_groups[original_index] = group_name
 
     return candidate_groups
