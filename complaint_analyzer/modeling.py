@@ -1,98 +1,444 @@
 from pathlib import Path
+from functools import lru_cache
+
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.pipeline import Pipeline
-from sklearn.svm import LinearSVC
+
+from sentence_transformers import SentenceTransformer
+
+from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, f1_score, classification_report
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    classification_report
+)
 from sklearn.cluster import KMeans
 
-MODEL_VERSION = 1
 
-def _build_model():
-    return Pipeline([
-        ("tfidf", TfidfVectorizer(lowercase=True, strip_accents="unicode", ngram_range=(1, 2), min_df=1, max_features=100_000, sublinear_tf=True)),
-        ("classifier", LinearSVC(class_weight="balanced", random_state=42))
-    ])
+# ==========================================
+# 1. MODEL CONFIGURATION
+# ==========================================
+
+MODEL_VERSION = 3
+RANDOM_STATE = 42
+
+REVIEW_THRESHOLD = 0.40
+
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+
+
+# ==========================================
+# 2. LOAD SENTENCE TRANSFORMER
+# ==========================================
+
+@lru_cache(maxsize=1)
+def _get_encoder():
+    """
+    Load and cache the pretrained Sentence Transformer.
+
+    Caching prevents the model from loading repeatedly
+    during application execution.
+    """
+    return SentenceTransformer(EMBEDDING_MODEL_NAME)
+
+
+# ==========================================
+# 3. PREPARE TRAINING DATA
+# ==========================================
+
+def _prepare_training_data(texts, labels):
+    """
+    Clean complaint text and category labels.
+    """
+    if len(texts) != len(labels):
+        raise ValueError(
+            "Number of complaints and labels must match."
+        )
+
+    df = pd.DataFrame({
+        "complaint": texts,
+        "category": labels
+    })
+
+    # Remove missing values
+    df = df.dropna(
+        subset=["complaint", "category"]
+    )
+
+    # Convert values into clean strings
+    df["complaint"] = (
+        df["complaint"].astype(str).str.strip()
+    )
+
+    df["category"] = (
+        df["category"].astype(str).str.strip()
+    )
+
+    # Remove empty complaints and labels
+    df = df[
+        (df["complaint"] != "")
+        & (df["category"] != "")
+    ]
+
+    # Identify complaints having multiple category labels
+    category_counts = (
+        df.groupby("complaint")["category"].nunique()
+    )
+
+    conflicting_texts = category_counts[
+        category_counts > 1
+    ].index
+
+    conflict_count = len(conflicting_texts)
+
+    # Remove conflicting complaints
+    df = df[
+        ~df["complaint"].isin(conflicting_texts)
+    ]
+
+    # Remove duplicate complaint-category pairs
+    before = len(df)
+
+    df = df.drop_duplicates(
+        subset=["complaint", "category"]
+    )
+
+    duplicate_count = before - len(df)
+
+    # Validate the remaining dataset
+    if len(df) < 4:
+        raise ValueError(
+            "At least four valid labeled examples are required."
+        )
+
+    if df["category"].nunique() < 2:
+        raise ValueError(
+            "At least two distinct categories are required."
+        )
+
+    # Store data-quality information
+    diagnostics = {
+        "usable_rows": len(df),
+        "duplicate_rows_removed": duplicate_count,
+        "conflicting_complaints_removed": conflict_count,
+        "category_distribution": (
+            df["category"].value_counts().to_dict()
+        )
+    }
+
+    return (
+        df["complaint"].tolist(),
+        df["category"].tolist(),
+        diagnostics
+    )
+
+
+# ==========================================
+# 4. TRAIN AND EVALUATE MODEL
+# ==========================================
 
 def train_and_evaluate(texts, labels, test_size=0.2):
-    pairs = [(str(t).strip(), str(y).strip()) for t, y in zip(texts, labels) if str(t).strip() and str(y).strip()]
-    texts, labels = [p[0] for p in pairs], [p[1] for p in pairs]
-    if len(texts) < 4: raise ValueError("Please provide at least 4 non-empty labeled examples; more is strongly recommended.")
+    """
+    Train a Logistic Regression classifier using
+    Sentence Transformer embeddings.
+    """
+    texts, labels, diagnostics = (
+        _prepare_training_data(texts, labels)
+    )
+
+    encoder = _get_encoder()
+
+    X_embeddings = encoder.encode(
+        texts,
+        show_progress_bar=False
+    )
+
     counts = pd.Series(labels).value_counts()
-    if len(counts) < 2: raise ValueError("Training requires at least two distinct categories.")
-    metrics = {"accuracy": None, "macro_f1": None, "report": {}, "evaluation_note": ""}
+
     n_classes = len(counts)
-    n_test = max(n_classes, int(round(len(texts) * float(test_size))))
-    can_stratify = counts.min() >= 2 and n_test >= n_classes and (len(texts) - n_test) >= n_classes
+    total_samples = len(texts)
+
+    metrics = {
+        "accuracy": None,
+        "macro_f1": None,
+        "report": {},
+        "evaluation_note": "",
+        "diagnostics": diagnostics
+    }
+
+    n_test = max(
+        n_classes,
+        int(np.ceil(total_samples * test_size))
+    )
+
+    n_train = total_samples - n_test
+
+    can_stratify = (
+        counts.min() >= 2
+        and n_test < total_samples
+        and n_test >= n_classes
+        and n_train >= n_classes
+    )
+
     if can_stratify:
-        X_train, X_test, y_train, y_test = train_test_split(texts, labels, test_size=test_size, random_state=42, stratify=labels)
-        evaluation_model = _build_model()
-        evaluation_model.fit(X_train, y_train)
-        pred = evaluation_model.predict(X_test)
-        metrics["accuracy"] = float(accuracy_score(y_test, pred))
-        metrics["macro_f1"] = float(f1_score(y_test, pred, average="macro", zero_division=0))
-        metrics["report"] = classification_report(y_test, pred, output_dict=True, zero_division=0)
-        metrics["evaluation_note"] = f"Stratified holdout evaluation: {len(X_train)} training rows and {len(X_test)} test rows. The final model is retrained on all rows after evaluation."
+        X_train, X_test, y_train, y_test = (
+            train_test_split(
+                X_embeddings,
+                labels,
+                test_size=n_test,  # Fixed to use integer n_test
+                random_state=RANDOM_STATE,
+                stratify=labels
+            )
+        )
+
+        evaluation_model = LogisticRegression(
+            class_weight="balanced",
+            random_state=RANDOM_STATE,
+            max_iter=1000
+        )
+
+        evaluation_model.fit(
+            X_train,
+            y_train
+        )
+
+        predictions = evaluation_model.predict(
+            X_test
+        )
+
+        metrics["accuracy"] = float(
+            accuracy_score(y_test, predictions)
+        )
+
+        metrics["macro_f1"] = float(
+            f1_score(
+                y_test,
+                predictions,
+                average="macro",
+                zero_division=0
+            )
+        )
+
+        metrics["report"] = classification_report(
+            y_test,
+            predictions,
+            output_dict=True,
+            zero_division=0
+        )
+
+        metrics["evaluation_note"] = (
+            f"Holdout evaluation completed. "
+            f"Training rows: {len(X_train)}. "
+            f"Testing rows: {len(X_test)}."
+        )
+
     else:
-        metrics["evaluation_note"] = "No reliable stratified holdout could be created because the data is small or one or more categories have too few examples. A model was trained on all rows, but no holdout score is reported. Add verified examples per category before judging performance."
-    final_model = _build_model()
-    final_model.fit(texts, labels)
+        metrics["evaluation_note"] = (
+            "A reliable stratified holdout evaluation "
+            "could not be created due to small class sizes."
+        )
+
+    final_model = LogisticRegression(
+        class_weight="balanced",
+        random_state=RANDOM_STATE,
+        max_iter=1000
+    )
+
+    final_model.fit(
+        X_embeddings,
+        labels
+    )
+
     return final_model, metrics
 
+
+# ==========================================
+# 5. SAVE TRAINED MODEL
+# ==========================================
+
 def save_model(model, path):
-    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump({"version": MODEL_VERSION, "model": model}, path)
+    path = Path(path)
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    payload = {
+        "version": MODEL_VERSION,
+        "model_name": EMBEDDING_MODEL_NAME,
+        "model": model
+    }
+
+    joblib.dump(
+        payload,
+        path
+    )
+
+
+# ==========================================
+# 6. LOAD SAVED MODEL
+# ==========================================
 
 def load_model(path):
     path = Path(path)
-    if not path.exists(): return None
+
+    if not path.exists():
+        return None
+
     payload = joblib.load(path)
-    return payload["model"] if isinstance(payload, dict) and "model" in payload else payload
+
+    if isinstance(payload, dict):
+        return payload.get("model")
+
+    return payload
+
+
+# ==========================================
+# 7. PREDICT NEW COMPLAINTS
+# ==========================================
 
 def predict_complaints(model, texts):
-    clean = [str(t) if t is not None else "" for t in texts]
-    predictions = ["Empty complaint text" if not t.strip() else "" for t in clean]
-    confidence = [0.0] * len(clean)
-    status = ["empty_text" if not t.strip() else "" for t in clean]
-    indices = [i for i, t in enumerate(clean) if t.strip()]
-    if indices:
-        valid = [clean[i] for i in indices]
-        pred = model.predict(valid)
-        decision = model.decision_function(valid)
-        if np.ndim(decision) == 1:
-            margins = np.abs(decision)
-        else:
-            sorted_scores = np.sort(decision, axis=1)
-            margins = sorted_scores[:, -1] - sorted_scores[:, -2]
-        # Review indicator only; not a calibrated probability.
-        normalized = margins / (1.0 + np.abs(margins))
-        for j, i in enumerate(indices):
-            predictions[i] = str(pred[j])
-            confidence[i] = float(normalized[j])
-            status[i] = "classified" if confidence[i] >= 0.20 else "review"
-    return pd.DataFrame({"predicted_category": predictions, "confidence": np.round(confidence, 4), "status": status})
+    clean_texts = [
+        str(text) if text is not None else ""
+        for text in texts
+    ]
 
-def discover_candidate_groups(texts, statuses, min_cluster_size=3):
-    groups = [""] * len(texts)
-    indices = [i for i, (t, s) in enumerate(zip(texts, statuses)) if str(t).strip() and s == "review"]
-    if len(indices) < min_cluster_size * 2: return groups
-    try:
-        vectorizer = TfidfVectorizer(ngram_range=(1, 2), min_df=1, max_features=20_000)
-        matrix = vectorizer.fit_transform([str(texts[i]) for i in indices])
-        if matrix.shape[1] < 2: return groups
-        n_clusters = min(max(2, len(indices) // min_cluster_size), 8, len(indices) - 1)
-        labels = KMeans(n_clusters=n_clusters, random_state=42, n_init=10).fit_predict(matrix)
-        counts = pd.Series(labels).value_counts()
-        names = {}
-        next_id = 1
-        for label, count in counts.items():
-            if count >= min_cluster_size:
-                names[int(label)] = f"Candidate group {next_id}"; next_id += 1
-        for local_i, original_i in enumerate(indices):
-            if int(labels[local_i]) in names: groups[original_i] = names[int(labels[local_i])]
-    except Exception:
-        pass  # Discovery is optional; classification should still complete.
-    return groups
+    predictions = [
+        "Empty complaint text"
+        for _ in clean_texts
+    ]
+
+    confidence = [
+        0.0 for _ in clean_texts
+    ]
+
+    status = [
+        "empty_text" for _ in clean_texts
+    ]
+
+    valid_indices = [
+        index
+        for index, text in enumerate(clean_texts)
+        if text.strip()
+    ]
+
+    if valid_indices:
+        valid_texts = [
+            clean_texts[index]
+            for index in valid_indices
+        ]
+
+        encoder = _get_encoder()
+
+        X_valid_embeddings = encoder.encode(
+            valid_texts,
+            show_progress_bar=False
+        )
+
+        predicted_labels = model.predict(
+            X_valid_embeddings
+        )
+
+        probabilities = model.predict_proba(
+            X_valid_embeddings
+        )
+
+        max_probs = np.max(
+            probabilities,
+            axis=1
+        )
+
+        for position, original_index in enumerate(
+            valid_indices
+        ):
+            predictions[original_index] = str(
+                predicted_labels[position]
+            )
+
+            confidence[original_index] = float(
+                max_probs[position]
+            )
+
+            status[original_index] = (
+                "classified"
+                if max_probs[position] >= REVIEW_THRESHOLD
+                else "review"
+            )
+
+    return pd.DataFrame({
+        "predicted_category": predictions,
+        "confidence": np.round(confidence, 4),
+        "status": status
+    })
+
+
+# ==========================================
+# 8. DISCOVER POTENTIAL NEW COMPLAINT GROUPS
+# ==========================================
+
+def discover_candidate_groups(
+    texts,
+    statuses,
+    min_cluster_size=3
+):
+    if len(texts) != len(statuses):
+        raise ValueError(
+            "Number of complaints and statuses must match."
+        )
+
+    review_texts = [
+        str(text).strip()
+        for text, status in zip(texts, statuses)
+        if text is not None
+        and str(text).strip()
+        and status == "review"
+    ]
+
+    if len(review_texts) < min_cluster_size * 2:
+        return []
+
+    encoder = _get_encoder()
+
+    embeddings = encoder.encode(
+        review_texts,
+        show_progress_bar=False
+    )
+
+    n_clusters = max(
+        2,
+        min(
+            int(np.sqrt(len(review_texts) / 2)),
+            len(review_texts) // min_cluster_size
+        )
+    )
+
+    if n_clusters >= len(review_texts):
+        return []
+
+    clustering = KMeans(
+        n_clusters=n_clusters,
+        random_state=RANDOM_STATE,
+        n_init=10
+    )
+
+    cluster_labels = clustering.fit_predict(
+        embeddings
+    )
+
+    candidate_groups = []
+
+    for cluster_id in range(n_clusters):
+        cluster_size = int(
+            np.sum(cluster_labels == cluster_id)
+        )
+
+        if cluster_size >= min_cluster_size:
+            candidate_groups.append(
+                f"Potential new complaint group "
+                f"{cluster_id + 1} "
+                f"({cluster_size} complaints)"
+            )
+
+    return candidate_groups
