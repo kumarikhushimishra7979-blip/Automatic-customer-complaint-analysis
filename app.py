@@ -1,170 +1,217 @@
 from pathlib import Path
 import sys
-import pandas as pd
-import streamlit as st
+import numpy as np
 import matplotlib.pyplot as plt
+import streamlit as st
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
-from complaint_analyzer.data_utils import read_table, find_complaint_column, find_category_column, normalize_training_frame, make_summary
-from complaint_analyzer.modeling import train_and_evaluate, load_model, save_model, predict_complaints, discover_candidate_groups
+
+from complaint_analyzer.data_utils import read_table, find_complaint_column, make_summary
+from complaint_analyzer.modeling import (
+    load_model, predict_complaints, discover_candidate_groups
+)
 from complaint_analyzer.reporting import build_excel, build_pdf
 
+MODEL_PATH = ROOT / "models" / "complaint_model.joblib"
+
+
+@st.cache_resource
+def get_trained_model():
+    return load_model(MODEL_PATH)
+
+
 st.set_page_config(page_title="Customer Complaint Analyzer", page_icon="📊", layout="wide")
-(ROOT / "models").mkdir(exist_ok=True)
-(ROOT / "data" / "training").mkdir(parents=True, exist_ok=True)
-(ROOT / "outputs").mkdir(exist_ok=True)
-
 st.title("📊 Customer Complaint Analyzer")
-st.caption("Local-first complaint classification, category summaries, candidate-group discovery, and downloadable reports.")
+st.caption(
+    "Upload an Excel/CSV file to automatically generate complaint categories, "
+    "insights, charts, and downloadable reports."
+)
+
 with st.sidebar:
-    st.header("Project status")
-    st.write("**Processing:** on this computer")
-    st.write("**External AI API:** not used")
-    st.info("Local processing reduces exposure but does not replace device security or access controls.")
-    st.markdown("**Training columns:** `complaint`, `category`")
+    st.header("Application")
+    st.success("Ready for complaint analysis")
+    st.caption("The trained model is maintained by the application developer.")
 
-analyze_tab, train_tab, guide_tab = st.tabs(["Analyze complaints", "Train / update model", "Instructions"])
+model = get_trained_model()
+if model is None:
+    st.error(
+        "The trained model is missing. The application administrator must run "
+        "training/train_model.py before users can analyze files."
+    )
+    st.stop()
 
-with analyze_tab:
-    st.subheader("1. Upload complaints")
-    upload = st.file_uploader("Choose a CSV or Excel file", type=["csv", "xlsx", "xls"], key="analyze_file")
-    if upload:
-        try:
-            raw = read_table(upload)
-            st.write("Preview")
+st.subheader("Upload your complaint file")
+uploaded_file = st.file_uploader("Choose an Excel or CSV file", type=["xlsx", "xls", "csv"])
+
+if uploaded_file is not None:
+    try:
+        raw = read_table(uploaded_file)
+        if raw.empty:
+            st.error("The uploaded file contains no data.")
+            st.stop()
+
+        st.success(f"File loaded: {uploaded_file.name} — {len(raw):,} rows")
+
+        columns = list(raw.columns)
+        preferred = [
+            "COMPLAINT_DETAILS", "complaint", "complaint_text",
+            "Complaint Text", "description"
+        ]
+        suggested = next(
+            (name for name in preferred if name in columns),
+            find_complaint_column(columns)
+        )
+        default_index = columns.index(suggested) if suggested in columns else 0
+
+        complaint_column = st.selectbox(
+            "Select the column containing complaint descriptions",
+            columns,
+            index=default_index
+        )
+
+        with st.expander("Preview uploaded data"):
             st.dataframe(raw.head(10), use_container_width=True)
-            suggested = find_complaint_column(raw.columns)
-            cols = list(raw.columns)
-            default_idx = cols.index(suggested) if suggested in cols else 0
-            complaint_col = st.selectbox("Select the complaint-text column", cols, index=default_idx)
-            if st.button("Analyze complaints", type="primary"):
-                model = load_model(ROOT / "models" / "complaint_model.joblib")
-                if model is None:
-                    st.error("No trained model found. Train it first in **Train / update model**.")
-                else:
-                    texts = raw[complaint_col].fillna("").astype(str).tolist()
-                    if not any(t.strip() for t in texts):
-                        st.error("The selected column contains no complaint text.")
-                    else:
-                        with st.spinner("Classifying complaints and checking for possible groups..."):
-                            pred = predict_complaints(model, texts)
-                            results = raw.copy()
-                            results["predicted_category"] = pred["predicted_category"]
-                            results["prediction_confidence"] = pred["confidence"]
-                            results["prediction_status"] = pred["status"]
-                            groups = discover_candidate_groups(texts, pred["status"].tolist(), min_cluster_size=3)
-                            results["candidate_group"] = groups
-                            st.session_state["results"] = results
-                            st.session_state["summary"] = make_summary(results)
-                            st.session_state["candidate_rows"] = results[results["candidate_group"].astype(str).str.strip().ne("")].copy()
-                            st.session_state["complaint_col"] = complaint_col
-                            st.session_state["source_name"] = upload.name
-        except Exception as exc:
-            st.error(f"Could not read or analyze this file: {exc}")
 
-    if "results" in st.session_state:
-        results = st.session_state["results"]
-        summary = st.session_state["summary"]
-        candidates = st.session_state["candidate_rows"]
-        a, b, c = st.columns(3)
-        a.metric("Complaints processed", f"{len(results):,}")
-        b.metric("Predicted categories", f"{results['predicted_category'].nunique():,}")
-        c.metric("Flagged for review", f"{(results['prediction_status'] != 'classified').sum():,}")
-        st.subheader("Categorized complaints")
-        st.dataframe(results, use_container_width=True, height=360)
-        st.subheader("Category distribution")
-        st.dataframe(summary, use_container_width=True)
-        if not summary.empty:
-            fig, ax = plt.subplots(figsize=(10, max(3, min(8, len(summary) * 0.35))))
-            plot_df = summary.sort_values("count", ascending=True)
-            ax.barh(plot_df["category"].astype(str), plot_df["count"])
-            ax.set_xlabel("Number of complaints")
-            ax.set_title("Complaint category distribution")
-            fig.tight_layout()
-            st.pyplot(fig)
-            plt.close(fig)
-        review = results[results["prediction_status"] != "classified"]
-        if not review.empty:
-            st.warning("Low-confidence predictions are flagged for review. Confidence is a margin indicator, not a probability.")
-            st.dataframe(review, use_container_width=True)
-        st.subheader("Possible new or unusual complaint groups")
-        if candidates.empty:
-            st.write("No sufficiently large candidate groups were detected in this run.")
-        else:
-            st.caption("These exploratory text clusters are not confirmed categories. Review them before adding any official category.")
-            st.dataframe(candidates[["candidate_group", st.session_state["complaint_col"], "predicted_category", "prediction_confidence"]], use_container_width=True)
-        excel_data = build_excel(results, summary, candidates)
-        pdf_data = build_pdf(results, summary, candidates, st.session_state.get("source_name", "uploaded file"))
-        left, right = st.columns(2)
-        left.download_button("⬇️ Download categorized Excel", excel_data, "categorized_complaints.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        right.download_button("⬇️ Download PDF report", pdf_data, "complaint_analysis_report.pdf", "application/pdf")
+        if st.button("Generate Complaint Insights", type="primary"):
+            texts = raw[complaint_column].fillna("").astype(str).tolist()
+            if not any(text.strip() for text in texts):
+                st.error("The selected column contains no complaint text.")
+                st.stop()
 
-with train_tab:
-    st.subheader("Train a model using verified labels")
-    st.warning("Use categories checked by a person. Keyword-generated labels may contain errors and should be audited before training.")
-    st.write("Each file must contain a complaint-text column and a category-label column. Preferred names are `complaint` and `category`.")
-    train_files = st.file_uploader("Upload one or more labeled CSV/Excel files", type=["csv", "xlsx", "xls"], accept_multiple_files=True, key="training_files")
-    if train_files:
-        for f in train_files:
-            try:
-                preview = read_table(f)
-                st.write(f"**{f.name}**")
-                st.dataframe(preview.head(5), use_container_width=True)
-            except Exception as exc:
-                st.error(f"Could not read {f.name}: {exc}")
-    test_size = st.slider("Test-set proportion", 0.1, 0.35, 0.2, 0.05)
-    if st.button("Train / refresh model", type="primary", disabled=not bool(train_files)):
-        try:
-            frames = []
-            for f in train_files:
-                df = read_table(f)
-                ccol = find_complaint_column(df.columns)
-                kcol = find_category_column(df.columns)
-                if ccol is None or kcol is None or ccol == kcol:
-                    st.error(f"Cannot identify distinct complaint and category columns in {f.name}. Rename them to `complaint` and `category`.")
-                    st.stop()
-                frame = normalize_training_frame(df, ccol, kcol)
-                frame["source_file"] = f.name
-                frames.append(frame)
-            training = pd.concat(frames, ignore_index=True)
-            training = training.dropna(subset=["complaint", "category"])
-            training["complaint"] = training["complaint"].astype(str).str.strip()
-            training["category"] = training["category"].astype(str).str.strip()
-            training = training[(training["complaint"] != "") & (training["category"] != "")]
-            old_n = len(training)
-            training = training.drop_duplicates(subset=["complaint", "category"])
-            st.write(f"Usable rows: **{len(training):,}**; exact duplicate complaint/category pairs removed: **{old_n-len(training):,}**")
-            st.dataframe(training.groupby("category").size().rename("examples").reset_index().sort_values("examples", ascending=False), use_container_width=True)
-            with st.spinner("Training and evaluating..."):
-                model, metrics = train_and_evaluate(training["complaint"].tolist(), training["category"].tolist(), test_size=float(test_size))
-                save_model(model, ROOT / "models" / "complaint_model.joblib")
-                training.to_csv(ROOT / "data" / "training" / "combined_training_data.csv", index=False, encoding="utf-8-sig")
-            st.success("Model trained and saved locally.")
-            st.write(metrics["evaluation_note"])
-            if metrics["accuracy"] is not None:
-                x, y = st.columns(2)
-                x.metric("Holdout accuracy", f"{metrics['accuracy']:.3f}")
-                y.metric("Holdout macro F1", f"{metrics['macro_f1']:.3f}")
-                st.dataframe(pd.DataFrame(metrics["report"]).T, use_container_width=True)
-                st.caption("Holdout scores are estimates, not guarantees. Review per-class scores and label quality.")
-            st.info("For later updates, upload the old labeled data together with new verified labeled datasets, then retrain. Keep category names consistent across files.")
-        except Exception as exc:
-            st.error(f"Training failed: {exc}")
+            with st.spinner("Analyzing complaints and preparing reports..."):
+                predictions = predict_complaints(model, texts)
+                results = raw.copy()
+                results["predicted_category"] = predictions["predicted_category"].tolist()
+                results["prediction_confidence"] = predictions["confidence"].tolist()
+                results["prediction_status"] = predictions["status"].tolist()
 
-with guide_tab:
-    st.subheader("Quick start")
-    st.markdown("""
-1. Install Python 3.11 or newer and the packages in `requirements.txt`.
-2. Run `streamlit run app.py` from this project folder.
-3. Open **Train / update model**, upload labeled data, and train.
-4. Open **Analyze complaints**, upload an unlabeled file, confirm the complaint column, and analyze.
-5. Download the categorized Excel workbook and PDF report.
+                groups = discover_candidate_groups(
+                    texts, predictions["status"].tolist(), min_cluster_size=3
+                )
+                if len(groups) != len(results):
+                    raise ValueError(
+                        "Candidate-group output does not match uploaded row count. "
+                        "Check discover_candidate_groups() in modeling.py."
+                    )
 
-**Training format:** one complaint per row, with the original complaint text in `complaint` and a checked label in `category`. Categories must be consistent across datasets.
+                results["candidate_group"] = groups
+                summary = make_summary(results)
+                candidates = results[
+                    results["candidate_group"].astype(str).str.strip().ne("")
+                ].copy()
 
-**Model:** TF-IDF text features + Linear SVM. It is a baseline text classifier. The app does not call an external AI API or cloud database. New-category discovery is exploratory clustering of lower-confidence complaints, not automatic confirmation of new categories.
+                st.session_state["analysis_results"] = results
+                st.session_state["analysis_summary"] = summary
+                st.session_state["analysis_candidates"] = candidates
+                st.session_state["analysis_source"] = uploaded_file.name
+                st.session_state["analysis_column"] = complaint_column
 
-**Privacy:** the application is designed for local execution. Do not expose its local web service to the internet or an untrusted network. Use non-confidential sample data when testing. Local execution alone does not guarantee security.
-""")
-    st.code("""customer_complaint_analyzer/\n├── app.py\n├── requirements.txt\n├── README.md\n├── complaint_analyzer/\n│   ├── data_utils.py\n│   ├── modeling.py\n│   └── reporting.py\n├── data/training/\n├── models/\n└── outputs/""")
+    except Exception as exc:
+        st.error(f"Analysis failed: {exc}")
+
+if "analysis_results" in st.session_state:
+    results = st.session_state["analysis_results"]
+    summary = st.session_state["analysis_summary"]
+    candidates = st.session_state["analysis_candidates"]
+    source_name = st.session_state["analysis_source"]
+    complaint_column = st.session_state["analysis_column"]
+
+    st.divider()
+    st.header("Complaint Analysis Dashboard")
+
+    total = len(results)
+    category_count = int(results["predicted_category"].nunique())
+    review_count = int((results["prediction_status"] != "classified").sum())
+    top3_count = int(summary.head(3)["count"].sum()) if not summary.empty else 0
+    top3_share = top3_count / total * 100 if total else 0
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total complaints", f"{total:,}")
+    m2.metric("Predicted categories", f"{category_count:,}")
+    m3.metric("Flagged for review", f"{review_count:,}")
+    m4.metric("Top 3 category share", f"{top3_share:.1f}%")
+
+    st.subheader("Category Summary")
+    if not summary.empty:
+        shown = summary.copy()
+        shown.insert(0, "Rank", range(1, len(shown) + 1))
+        shown = shown.rename(columns={
+            "category": "Issue Type",
+            "count": "Complaint Count",
+            "percentage": "Percentage"
+        })
+        st.dataframe(shown, hide_index=True, use_container_width=True)
+
+        plot_df = summary.sort_values("count", ascending=True)
+
+        fig, ax = plt.subplots(
+            figsize=(12, max(3.5, min(12, len(plot_df) * 0.38)))
+        )
+
+        # Generate a different colour for every complaint category.
+        colors = plt.cm.tab20(np.linspace(0, 1, len(plot_df)))
+        bars = ax.barh(
+            plot_df["category"].astype(str),
+            plot_df["count"],
+            color=colors,
+            edgecolor="white",
+            linewidth=0.8
+        )
+        ax.bar_label(bars, padding=4, fontsize=9)
+        ax.set_title("Complaints by Issue Type", fontsize=14, weight="bold")
+        ax.set_xlabel("Number of Complaints")
+        ax.set_ylabel("Issue Type")
+        ax.grid(axis="x", alpha=0.25)
+        ax.set_axisbelow(True)
+
+        fig.tight_layout()
+        st.pyplot(fig, use_container_width=True)
+        plt.close(fig)
+
+    st.subheader("Categorized Complaints")
+    st.dataframe(results, use_container_width=True, height=400)
+
+    review = results[results["prediction_status"] != "classified"]
+    if not review.empty:
+        st.subheader("Complaints Requiring Human Review")
+        st.warning(
+            "These predictions did not meet the model's confidence threshold. "
+            "Review them before taking action."
+        )
+        st.dataframe(review, use_container_width=True)
+
+    st.subheader("Potential New Complaint Groups")
+    if candidates.empty:
+        st.info("No sufficiently large candidate groups were detected.")
+    else:
+        st.caption(
+            "These are exploratory text clusters, not confirmed official categories."
+        )
+        st.dataframe(
+            candidates[[
+                "candidate_group", complaint_column,
+                "predicted_category", "prediction_confidence"
+            ]],
+            use_container_width=True
+        )
+
+    st.subheader("Download Reports")
+    excel_bytes = build_excel(results, summary, candidates)
+    pdf_bytes = build_pdf(results, summary, candidates, source_name)
+
+    left, right = st.columns(2)
+    left.download_button(
+        "⬇️ Download Excel Report",
+        data=excel_bytes,
+        file_name="customer_complaint_categorization_report.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True
+    )
+    right.download_button(
+        "⬇️ Download PDF Report",
+        data=pdf_bytes,
+        file_name="customer_complaint_categorization_report.pdf",
+        mime="application/pdf",
+        use_container_width=True
+    )
