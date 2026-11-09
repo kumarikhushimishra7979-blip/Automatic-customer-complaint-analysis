@@ -1,6 +1,6 @@
 from pathlib import Path
 import sys
-
+import numpy as np
 import matplotlib.pyplot as plt
 import streamlit as st
 
@@ -144,13 +144,27 @@ if "analysis_results" in st.session_state:
         st.dataframe(shown, hide_index=True, use_container_width=True)
 
         plot_df = summary.sort_values("count", ascending=True)
-        fig, ax = plt.subplots(figsize=(12, max(3.5, min(12, len(plot_df) * 0.38))))
-        ax.barh(plot_df["category"].astype(str), plot_df["count"])
+
+        fig, ax = plt.subplots(
+            figsize=(12, max(3.5, min(12, len(plot_df) * 0.38)))
+        )
+
+        # Generate a different colour for every complaint category.
+        colors = plt.cm.tab20(np.linspace(0, 1, len(plot_df)))
+        bars = ax.barh(
+            plot_df["category"].astype(str),
+            plot_df["count"],
+            color=colors,
+            edgecolor="white",
+            linewidth=0.8
+        )
+        ax.bar_label(bars, padding=4, fontsize=9)
         ax.set_title("Complaints by Issue Type", fontsize=14, weight="bold")
         ax.set_xlabel("Number of Complaints")
         ax.set_ylabel("Issue Type")
         ax.grid(axis="x", alpha=0.25)
         ax.set_axisbelow(True)
+
         fig.tight_layout()
         st.pyplot(fig, use_container_width=True)
         plt.close(fig)
