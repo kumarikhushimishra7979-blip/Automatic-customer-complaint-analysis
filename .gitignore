@@ -5,3 +5,17 @@ models/*.joblib
 data/training/*.csv
 outputs/*
 .streamlit/secrets.toml
+# Confidential training data
+training/*.xlsx
+training/*.csv
+
+# Trained model files
+models/*.joblib
+models/*.pkl
+
+# Generated reports
+outputs/
+
+# Python cache
+__pycache__/
+*.pyc

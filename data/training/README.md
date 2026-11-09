@@ -1,1 +1,0 @@
-Use reviewed, labeled complaint datasets. Preferred columns: complaint, category. Do not place confidential data in public repositories. The app accepts training files in the Train / update model tab.
